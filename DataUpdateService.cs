@@ -21,6 +21,21 @@ public class DataUpdateService : BackgroundService
         _logger = logger;
     }
 
+    private static DateTime? GetLatestDailyPriceDate()
+{
+    DataTable? dt = null;
+    if (!FillDataTable_ViaSql(ref dt, "SELECT MAX(StockDate) AS MaxDate FROM StockDailyPrice") || dt == null || dt.Rows.Count == 0)
+        return null;
+
+    var obj = dt.Rows[0]["MaxDate"];
+    if (obj == DBNull.Value) return null;
+
+    if (DateTime.TryParse(obj.ToString(), out var d))
+        return d.Date;
+
+    return null;
+}
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)     //Data is updated everyday at 8:PM
     {
         await Task.Delay(1000, stoppingToken);
@@ -38,6 +53,22 @@ public class DataUpdateService : BackgroundService
                     if (currentHour == 20)
                     {
                         StartDailyPriceUpdate();
+                    }
+                    else
+                    {
+                        // Catch-up logic: if prices are stale, run even if we missed 8pm
+                        var latest = GetLatestDailyPriceDate();
+                        if (latest != null)
+                        {
+                            var today = Program.GetCentralTimeNow().Date;
+                    
+                            // If latest date is older than yesterday, we're behind
+                            if (latest.Value < today.AddDays(-1))
+                            {
+                                LogAndWriteLine($"Daily prices look stale. Latest in DB: {latest:yyyy-MM-dd}. Running catch-up update now.");
+                                StartDailyPriceUpdate();
+                            }
+                        }
                     }
 
                     if (currentHour == 19)
@@ -186,7 +217,16 @@ public class DataUpdateService : BackgroundService
 
         if (temp == "" || temp == "error" || temp.StartsWith("REMOTE_ADDR") || temp.IndexOf("\"code\":\"Not Found\"") > -1 || temp == "(404) Not Found")
         {
-            return;
+            LogAndWriteLine($"[{ThreadID}]{Ticker} Yahoo AnonDownload FAILED. Trying direct Download_v2. temp='{(temp.Length > 60 ? temp.Substring(0, 60) : temp)}'");
+        
+            // Fallback: try without proxies
+            temp = over_http.Download_v2("https://query2.finance.yahoo.com/v8/finance/chart/" + Ticker + "?symbol=" + Ticker + "&period1=" + StartPeriod + "&period2=" + EndPeriod + "&interval=1d&events=div%7Csplit");
+        
+            if (temp == "" || temp == "error" || temp.StartsWith("REMOTE_ADDR") || temp.IndexOf("\"code\":\"Not Found\"") > -1 || temp == "(404) Not Found")
+            {
+                LogAndWriteLine($"[{ThreadID}]{Ticker} Yahoo Download_v2 FAILED too. Skipping.");
+                return;
+            }
         }
 
         using (JsonDocument document = JsonDocument.Parse(temp))
